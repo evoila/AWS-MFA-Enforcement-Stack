@@ -1,0 +1,260 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Enforce MFA IAM policy and User Group
+
+Resources:
+  EnforceMFAPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: "Policy that enforces MFA"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "AllowViewAccountInfo"
+            Effect: "Allow"
+            Action:
+              - "iam:GetAccountPasswordPolicy"
+              - "iam:ListVirtualMFADevices"
+            Resource: "*"
+          - Sid: "AllowManageOwnPasswords"
+            Effect: "Allow"
+            Action:
+              - "iam:ChangePassword"
+              - "iam:GetUser"
+            Resource: "arn:aws:iam::*:user/${aws:username}"
+          - Sid: "AllowManageOwnAccessKeys"
+            Effect: "Allow"
+            Action:
+              - "iam:CreateAccessKey"
+              - "iam:DeleteAccessKey"
+              - "iam:ListAccessKeys"
+              - "iam:UpdateAccessKey"
+              - "iam:GetAccessKeyLastUsed"
+            Resource: "arn:aws:iam::*:user/${aws:username}"
+          - Sid: "AllowManageOwnSigningCertificates"
+            Effect: "Allow"
+            Action:
+              - "iam:DeleteSigningCertificate"
+              - "iam:ListSigningCertificates"
+              - "iam:UpdateSigningCertificate"
+              - "iam:UploadSigningCertificate"
+            Resource: "arn:aws:iam::*:user/${aws:username}"
+          - Sid: "AllowManageOwnSSHPublicKeys"
+            Effect: "Allow"
+            Action:
+              - "iam:DeleteSSHPublicKey"
+              - "iam:GetSSHPublicKey"
+              - "iam:ListSSHPublicKeys"
+              - "iam:UpdateSSHPublicKey"
+              - "iam:UploadSSHPublicKey"
+            Resource: "arn:aws:iam::*:user/${aws:username}"
+          - Sid: "AllowManageOwnGitCredentials"
+            Effect: "Allow"
+            Action:
+              - "iam:CreateServiceSpecificCredential"
+              - "iam:DeleteServiceSpecificCredential"
+              - "iam:ListServiceSpecificCredentials"
+              - "iam:ResetServiceSpecificCredential"
+              - "iam:UpdateServiceSpecificCredential"
+            Resource: "arn:aws:iam::*:user/${aws:username}"
+          - Sid: "AllowManageOwnVirtualMFADevice"
+            Effect: "Allow"
+            Action:
+              - "iam:CreateVirtualMFADevice"
+            Resource: "arn:aws:iam::*:mfa/*"
+          - Sid: "AllowManageOwnUserMFA"
+            Effect: "Allow"
+            Action:
+              - "iam:DeactivateMFADevice"
+              - "iam:EnableMFADevice"
+              - "iam:ListMFADevices"
+              - "iam:ResyncMFADevice"
+            Resource: "arn:aws:iam::*:user/${aws:username}"
+          - Sid: "DenyAllExceptListedIfNoMFA"
+            Effect: "Deny"
+            NotAction:
+              - "iam:CreateVirtualMFADevice"
+              - "iam:EnableMFADevice"
+              - "iam:GetUser"
+              - "iam:GetMFADevice"
+              - "iam:ListMFADevices"
+              - "iam:ListVirtualMFADevices"
+              - "iam:ResyncMFADevice"
+              - "sts:GetSessionToken"
+            Resource: "*"
+            Condition:
+              BoolIfExists:
+                "aws:MultiFactorAuthPresent": "false"
+
+  Group:
+    Type: AWS::IAM::Group
+    Properties:
+      ManagedPolicyArns:
+        - !Ref EnforceMFAPolicy
+
+  IamUserMfaEnabled:
+    Type: "AWS::Config::ConfigRule"
+    Properties:
+      Description: "Checks if AWS multi-factor authentication (MFA) is enabled for all AWS Identity and Access Management (IAM) users that use a console password. The rule is COMPLIANT if MFA is enabled."
+      Source:
+        Owner: "AWS"
+        SourceIdentifier: "MFA_ENABLED_FOR_IAM_CONSOLE_ACCESS"
+
+  RemediationConfiguration:
+    Type: "AWS::Config::RemediationConfiguration"
+    Properties:
+      Automatic: true
+      MaximumAutomaticAttempts: 3
+      RetryAttemptSeconds: 60
+      ConfigRuleName: !Ref IamUserMfaEnabled
+      Parameters:
+        AutomationAssumeRole:
+          StaticValue:
+            Values:
+              - !GetAtt SNSPublisherRole.Arn
+        TopicArn:
+          StaticValue:
+            Values:
+              - !Ref SNSTopic
+        Message:
+          ResourceValue:
+            Value: "RESOURCE_ID"
+      TargetId: "AWS-PublishSNSNotification"
+      TargetType: "SSM_DOCUMENT"
+      TargetVersion: "1"
+
+  LambdaLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      RetentionInDays: 180
+
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !GetAtt LambdaLogGroup.Arn
+              - Effect: Allow
+                Action:
+                  - "iam:AddUserToGroup"
+                Resource: !GetAtt Group.Arn
+              - Effect: Allow
+                Action:
+                  - "config:GetResourceConfigHistory"
+                Resource: "*"
+
+  FunctionInvokePermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref LambdaFunction
+      SourceArn: !Ref SNSTopic
+      Principal: sns.amazonaws.com
+
+  LambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          ENFORCE_MFA_GROUP_NAME: !Ref Group
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+
+          def lambda_handler(event, context):
+              resource_id = event['Records'][0]['Sns']['Message']
+
+              config_client = boto3.client('config')
+              response = config_client.get_resource_config_history(
+                  resourceType='AWS::IAM::User',
+                  resourceId=resource_id,
+                  limit=1
+              )
+              
+              user_name = response['configurationItems'][0]['resourceName']
+              group_name = os.environ['ENFORCE_MFA_GROUP_NAME']
+              
+              client = boto3.client('iam')
+              try:
+                  client.add_user_to_group(UserName=user_name, GroupName=group_name)
+                  print(f'Successfully added user {user_name} to group {group_name}.')
+              except Exception as e:
+                  print(f'Failed to add user {user_name} to group {group_name}: {str(e)}')
+
+      Runtime: python3.12
+      Timeout: 15
+      LoggingConfig:
+        LogGroup: !Ref LambdaLogGroup
+
+  SNSTopic:
+    Type: "AWS::SNS::Topic"
+
+  SNSSubscription:
+    Type: "AWS::SNS::Subscription"
+    Properties:
+      Protocol: "lambda"
+      Endpoint: !GetAtt LambdaFunction.Arn
+      TopicArn: !Ref SNSTopic
+
+  SNSPublisherRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "ssm.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "AWS:SourceAccount": !Ref "AWS::AccountId"
+      Path: "/"
+      Policies:
+        - PolicyName: "SNSPublishPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "sns:Publish"
+                Resource: !Ref SNSTopic
+
+  SNSTopicPolicy:
+    Type: "AWS::SNS::TopicPolicy"
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action: "SNS:Publish"
+            Effect: Allow
+            Principal:
+              Service:
+                - ssm.amazonaws.com
+            Resource: !Ref SNSTopic
+            Condition:
+              StringEquals:
+                "AWS:SourceAccount": !Ref "AWS::AccountId"
+        Version: 2012-10-17
+      Topics:
+        - !Ref SNSTopic
